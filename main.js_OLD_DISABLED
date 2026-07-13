@@ -1,0 +1,1190 @@
+
+ * doc-checker/main.js — точка входа
+ * Вызовы через PHP-прокси handler.php → Anthropic API.
+ * Claude читает PDF/DOCX нативно через document-блок. v63
+ */
+
+import {
+  fileToBase64,
+  extractPdfText,
+  extractExcelAsText,
+  getFileType,
+  formatFileSize,
+} from './pdf-processor.js';
+
+// Определяем провайдера — запрашиваем из handler.php при старте
+let _aiProvider = 'yandex'; // по умолчанию, уточняется при первом запросе
+async function detectProvider() {
+  try {
+    const resp = await fetch('./api/handler.php?test=1');
+    const data = await resp.json();
+    _aiProvider = data.provider || 'yandex';
+    console.log('[doc-checker] AI провайдер:', _aiProvider);
+  } catch { /* используем дефолт */ }
+}
+
+import {
+  DOC_TYPES,
+  detectDocType,
+  getTypeLabel,
+  getTypeIcon,
+  extractDocumentData,
+  crossCheck,
+  buildSummaryTableData,
+  generateConclusion,
+} from './doc-analyzer.js';
+
+// getUserPatternsPrompt определён ниже в этом файле (не импорт)
+
+// ─── Состояние ───────────────────────────────────────────────────────────────
+
+const zones = {
+  1: { files: [], multiple: false },
+  2: { files: [], multiple: true  },
+  3: { files: [], multiple: true  },
+  4: { files: [], multiple: true  },
+};
+
+let analyzing = false;
+let results   = null;
+let fileIdCounter = 0;
+
+const MAX_MB = 20;
+const ALLOWED_EXTS = ['pdf', 'docx', 'doc', 'xlsx', 'xls', 'txt', 'csv', 'md', 'png', 'jpg', 'jpeg'];
+const CONCURRENCY    = 2;
+const BATCH_PAUSE_MS = 3000;
+const PATTERNS_KEY   = 'doc_checker_patterns_v1';
+
+let _userPatterns = []; // пользовательские паттерны (из sessionStorage)
+
+// ─── DOM ─────────────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+
+// ─── Инициализация ────────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', () => {
+  detectProvider(); // определяем провайдера в фоне
+  [1, 2, 3, 4].forEach(z => initZone(z));
+  $('analyzeBtn').addEventListener('click', showConfirmDialog);
+  loadUserPatterns();
+  // Делегирование: удаление файлов
+  [1, 2, 3, 4].forEach(z => $('fileChips' + z).addEventListener('click', onChipRemoveClick));
+  $('clearBtn').addEventListener('click', clearAll);
+  $('downloadArchiveBtn')?.addEventListener('click', downloadArchive);
+  $('confirmStartBtn').addEventListener('click', () => {
+    $('confirmOverlay').classList.add('hidden');
+    runAnalysis();
+  });
+  $('confirmCancelBtn').addEventListener('click', () => {
+    $('confirmOverlay').classList.add('hidden');
+  });
+  $('confirmOverlay').addEventListener('click', e => {
+    if (e.target === $('confirmOverlay')) $('confirmOverlay').classList.add('hidden');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      $('confirmOverlay').classList.add('hidden');
+      $('feedbackOverlay')?.classList.add('hidden');
+      $('patternsOverlay')?.classList.add('hidden');
+    }
+  });
+
+  // Feedback modal
+  $('feedbackCloseBtn').addEventListener('click', closeFeedback);
+  $('feedbackCancelBtn').addEventListener('click', closeFeedback);
+  $('feedbackOverlay').addEventListener('click', e => { if (e.target === $('feedbackOverlay')) closeFeedback(); });
+  $('feedbackSaveBtn').addEventListener('click', saveFeedbackPattern);
+  [$('fbWrong'), $('fbCorrect'), $('fbContext'), $('fbField')].forEach(el => el?.addEventListener('input', updatePatternPreview));
+
+  // Patterns modal
+  $('patternsCloseBtn').addEventListener('click', () => $('patternsOverlay').classList.add('hidden'));
+  $('patternsCloseBtnBottom').addEventListener('click', () => $('patternsOverlay').classList.add('hidden'));
+  $('patternsOverlay').addEventListener('click', e => { if (e.target === $('patternsOverlay')) $('patternsOverlay').classList.add('hidden'); });
+  $('patternsClearBtn').addEventListener('click', clearUserPatterns);
+  $('showPatternsBtn')?.addEventListener('click', openPatternsModal);
+});
+
+function initZone(z) {
+  const dropArea  = $('dropZone' + z);
+  const fileInput = $('fileInput' + z);
+
+  dropArea.addEventListener('click', () => fileInput.click());
+  dropArea.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+
+  dropArea.addEventListener('dragover', e => { e.preventDefault(); dropArea.classList.add('drag-over'); });
+  dropArea.addEventListener('dragleave', () => dropArea.classList.remove('drag-over'));
+  dropArea.addEventListener('drop', e => {
+    e.preventDefault();
+    dropArea.classList.remove('drag-over');
+    addFiles(z, Array.from(e.dataTransfer.files));
+  });
+
+  fileInput.addEventListener('change', () => {
+    addFiles(z, Array.from(fileInput.files));
+    fileInput.value = '';
+  });
+}
+
+// ─── Управление файлами ───────────────────────────────────────────────────────
+
+function addFiles(zone, files) {
+  const zoneData = zones[zone];
+
+  for (const file of files) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!ALLOWED_EXTS.includes(ext)) {
+      showToast('Формат не поддерживается: ' + file.name, 'error'); continue;
+    }
+    if (file.size > MAX_MB * 1024 * 1024) {
+      showToast('Файл слишком большой (>' + MAX_MB + 'МБ): ' + file.name, 'error'); continue;
+    }
+    if (zone === 1 && zoneData.files.length >= 1) {
+      zoneData.files = [];
+    }
+
+    const type = detectDocType(file.name, '');
+    const id   = ++fileIdCounter;
+    zoneData.files.push({
+      id, file, name: file.name, size: file.size, type,
+      base64: null, mediaType: null, textContent: null,
+      data: null, status: 'pending', error: null, zone,
+    });
+  }
+
+  renderZoneChips(zone);
+  updateAnalyzeBtn();
+}
+
+function removeFile(zone, id) {
+  zones[zone].files = zones[zone].files.filter(f => f.id !== id);
+  renderZoneChips(zone);
+  updateAnalyzeBtn();
+}
+
+function clearAll() {
+  [1, 2, 3, 4].forEach(z => { zones[z].files = []; renderZoneChips(z); });
+  results = null;
+  $('resultsBlock').classList.add('hidden');
+  $('progressBlock').classList.add('hidden');
+  updateAnalyzeBtn();
+}
+
+// ─── Рендер чипов файлов ─────────────────────────────────────────────────────
+
+const STATUS_LABELS = {
+  pending:    { label: 'Ожидает',     cls: 'pending'    },
+  reading:    { label: 'Чтение...',   cls: 'extracting' },
+  analyzing:  { label: 'Анализ...',   cls: 'analyzing'  },
+  done:       { label: '✓ Готово',    cls: 'done'       },
+  error:      { label: '✕ Ошибка',    cls: 'error'      },
+};
+
+function renderZoneChips(zone) {
+  const container = $('fileChips' + zone);
+  const badge     = $('zone' + zone + 'Badge');
+  const files     = zones[zone].files;
+
+  if (!files.length) {
+    container.innerHTML = '';
+    badge.innerHTML = '';
+    return;
+  }
+
+  badge.innerHTML = '<span class="zone-count-badge">' + files.length + ' ' + pluralFiles(files.length) + '</span>';
+
+  container.innerHTML = files.map(f => {
+    const st = STATUS_LABELS[f.status] || STATUS_LABELS.pending;
+    const icon = getTypeIcon(f.type);
+    return '<div class="file-chip" data-id="' + f.id + '" data-zone="' + zone + '">' +
+      '<span>' + icon + '</span>' +
+      '<span class="file-chip-name" title="' + escHtml(f.name) + '">' + escHtml(f.name) + '</span>' +
+      '<span class="file-chip-status ' + st.cls + '">' + st.label + '</span>' +
+      (f.ocrPages > 0 ? '<span class="file-chip-ocr">OCR:' + f.ocrPages + '</span>' : '') +
+      '<button class="file-chip-remove" data-id="' + f.id + '" data-zone="' + zone + '" aria-label="Удалить" ' + (analyzing ? 'disabled' : '') + '>✕</button>' +
+      '</div>';
+  }).join('');
+
+  container.querySelectorAll('.file-chip-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeFile(+btn.dataset.zone, +btn.dataset.id));
+  });
+}
+
+function updateChipStatus(zone, id) {
+  const f = zones[zone].files.find(f => f.id === id);
+  if (!f) return;
+  const chip = document.querySelector('.file-chip[data-id="' + id + '"]');
+  if (!chip) return;
+  const st = STATUS_LABELS[f.status] || STATUS_LABELS.pending;
+  const statusEl = chip.querySelector('.file-chip-status');
+  if (statusEl) { statusEl.textContent = st.label; statusEl.className = 'file-chip-status ' + st.cls; }
+}
+
+function updateAnalyzeBtn() {
+  const total = allFiles().length;
+  $('analyzeBtn').disabled = total === 0 || analyzing;
+  $('clearBtn').disabled   = analyzing;
+}
+
+function allFiles() {
+  return [1, 2, 3, 4].flatMap(z => zones[z].files);
+}
+
+function pluralFiles(n) {
+  if (n % 10 === 1 && n % 100 !== 11) return 'файл';
+  if ([2,3,4].includes(n % 10) && ![12,13,14].includes(n % 100)) return 'файла';
+  return 'файлов';
+}
+
+// ─── Диалог подтверждения ─────────────────────────────────────────────────────
+
+function showConfirmDialog() {
+  if (analyzing) return;
+
+  const zoneLabels = {
+    1: { label: 'Окно 1: Документ на оплату', cls: 'zone-tag-1' },
+    2: { label: 'Окно 2: Договор/ТЗ',         cls: 'zone-tag-2' },
+    3: { label: 'Окно 3: Первичка',            cls: 'zone-tag-3' },
+    4: { label: 'Окно 4: Доп. документы',      cls: 'zone-tag-4' },
+  };
+
+  const summaryEl = $('confirmFilesSummary');
+  summaryEl.innerHTML = [1, 2, 3, 4].map(z => {
+    const files = zones[z].files;
+    if (!files.length) return '';
+    return '<div style="margin-bottom:0.5rem;"><span style="font-size:0.75rem;font-weight:700;color:#94a3b8;">' + zoneLabels[z].label + '</span>' +
+      files.map(f =>
+        '<div class="confirm-file-row"><span>' + getTypeIcon(f.type) + '</span><span>' + escHtml(f.name) + '</span></div>'
+      ).join('') + '</div>';
+  }).join('');
+
+  const missing = [];
+  if (!zones[1].files.length) missing.push('📄 Документ на оплату (Окно 1) — обязателен');
+  if (!zones[2].files.length) missing.push('📋 Договор/ТЗ (Окно 2) — без него реквизиты не проверить');
+
+  const warnEl = $('confirmWarning');
+  if (missing.length) {
+    warnEl.innerHTML = '⚠️ Возможно, не хватает документов:<br>' + missing.join('<br>');
+    warnEl.classList.remove('hidden');
+  } else {
+    warnEl.classList.add('hidden');
+  }
+
+  $('confirmOverlay').classList.remove('hidden');
+}
+
+// ─── Основной анализ ──────────────────────────────────────────────────────────
+
+async function runAnalysis() {
+  if (analyzing) return;
+
+  analyzing = true;
+  results   = null;
+
+  $('resultsBlock').classList.add('hidden');
+  $('progressBlock').classList.remove('hidden');
+  updateAnalyzeBtn();
+
+  allFiles().forEach(f => {
+    f.status = 'pending'; f.error = null; f.data = null;
+  });
+  [1, 2, 3, 4].forEach(z => renderZoneChips(z));
+
+  try {
+    const files = allFiles();
+    const total = files.length;
+    let done = 0;
+
+    async function runInBatches(items, taskFn) {
+      for (let i = 0; i < items.length; i += CONCURRENCY) {
+        const batch = items.slice(i, i + CONCURRENCY);
+        await Promise.all(batch.map(item => taskFn(item)));
+        if (i + CONCURRENCY < items.length) await sleep(BATCH_PAUSE_MS);
+      }
+    }
+
+    // ── Шаг 1: Чтение файлов → base64 ────────────────────────────────────
+    setProgress(0, 'Этап 1: Чтение файлов...', 'Читаю 0/' + total + '...');
+
+    await runInBatches(files, async (f) => {
+      f.status = 'reading';
+      updateChipStatus(f.zone, f.id);
+      try {
+        const ft = getFileType(f.name);
+        if (ft === 'xlsx') {
+          f.textContent = await extractExcelAsText(f.file);
+          f.mediaType   = 'text/plain';
+        } else if (ft === 'pdf' && _aiProvider === 'yandex') {
+          try {
+            const pdfText = await extractPdfText(f.file);
+            if (pdfText && pdfText.length > 50) {
+              f.textContent = pdfText;
+              f.mediaType   = 'text/plain';
+            } else {
+              const { base64, mediaType } = await fileToBase64(f.file);
+              f.base64 = base64; f.mediaType = mediaType; f.isScanned = true;
+            }
+          } catch {
+            const { base64, mediaType } = await fileToBase64(f.file);
+            f.base64 = base64; f.mediaType = mediaType;
+          }
+        } else {
+          const { base64, mediaType } = await fileToBase64(f.file);
+          f.base64    = base64;
+          f.mediaType = mediaType;
+        }
+        f.type = detectDocType(f.name, f.textContent || '');
+        f.status = 'analyzing';
+      } catch (err) {
+        f.status = 'error'; f.error = err.message;
+      }
+      done++;
+      setProgress(Math.round(done / total * 20), 'Этап 1: Чтение файлов...', 'Прочитано ' + done + '/' + total);
+      updateChipStatus(f.zone, f.id);
+    });
+
+    // ── Шаг 2: AI-извлечение данных (нативное чтение Claude) ─────────────
+    const toAnalyze = files.filter(f => f.status !== 'error');
+    done = 0;
+    setProgress(20, 'Этап 2: Claude читает документы...', 'Обрабатываю 0/' + toAnalyze.length + '...');
+
+    await runInBatches(toAnalyze, async (f) => {
+      try {
+        f.status = 'analyzing';
+        updateChipStatus(f.zone, f.id);
+        const fileObj = {
+          base64:      f.base64,
+          mediaType:   f.mediaType,
+          textContent: f.textContent,
+          filename:    f.name,
+        };
+        f.data = await extractDocumentData(
+          fileObj,
+          f.type,
+          f.name,
+          msg => setProgress(null, null, f.name + ': ' + msg),
+          f.zone,
+        );
+        f.status = 'done';
+      } catch (err) {
+        f.error = err.message; f.status = 'error';
+      }
+      done++;
+      setProgress(20 + Math.round(done / toAnalyze.length * 50), 'Этап 2: Claude читает документы...', 'Обработано ' + done + '/' + toAnalyze.length);
+      updateChipStatus(f.zone, f.id);
+    });
+
+    setProgress(70, 'Этап 3: Программная сверка...', 'Сравниваю суммы и реквизиты...');
+
+    const successFiles = files.filter(f => f.data && f.status !== 'error');
+    const docList = successFiles.map(f => ({
+      filename: f.name,
+      type: f.type,
+      data: f.data,
+      zone: f.zone,
+    }));
+    const issues = crossCheck(docList);
+
+    setProgress(80, 'Этап 4: AI-заключение...', 'Формирую заключение...');
+
+    const extraInstructions = $('customPrompt')?.value?.trim() || '';
+    let conclusion = '';
+    try {
+      conclusion = await generateConclusion(docList, issues, msg => setProgress(null, null, msg), extraInstructions);
+    } catch (err) {
+      conclusion = 'Ошибка формирования заключения: ' + err.message;
+    }
+
+    [1, 2, 3, 4].forEach(z => renderZoneChips(z));
+
+    results = { issues, conclusion, documents: docList, summaryData: buildSummaryTableData(docList) };
+    setProgress(100, 'Готово!', 'Анализ завершён');
+
+    setTimeout(() => {
+      $('progressBlock').classList.add('hidden');
+      renderResults();
+      $('resultsBlock').classList.remove('hidden');
+      $('resultsBlock').scrollIntoView({ behavior: 'smooth' });
+    }, 500);
+
+  } catch (err) {
+    setProgress(null, 'Ошибка: ' + err.message, err.message);
+    showToast('Ошибка анализа: ' + err.message, 'error');
+  } finally {
+    analyzing = false;
+    updateAnalyzeBtn();
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Отображение результатов ──────────────────────────────────────────────────
+
+function renderResults() {
+  const { issues, conclusion, documents, summaryData } = results;
+  renderDocCards(documents);
+  renderSummaryTable(summaryData);
+  renderIssues(issues);
+  $('conclusionText').innerHTML = markdownToHtml(conclusion);
+}
+
+const ZONE_TAG_CSS = { 1: 'zone-tag-1', 2: 'zone-tag-2', 3: 'zone-tag-3', 4: 'zone-tag-4' };
+const ZONE_NAMES   = { 1: 'Окно 1', 2: 'Окно 2', 3: 'Окно 3', 4: 'Окно 4' };
+
+function renderDocCards(documents) {
+  const wrap = $('docCardsWrap');
+  if (!documents.length) { wrap.innerHTML = '<div style="color:#64748b;">Нет успешно обработанных документов</div>'; return; }
+
+  wrap.innerHTML = documents.map(d => {
+    const data  = d.data || {};
+    const items = data.items || [];
+    const totals = data.totals || {};
+    const zone  = d.zone || 4;
+    const icon  = getTypeIcon(d.type);
+
+    const fields = [
+      ['Тип',      getTypeLabel(d.type)],
+      ['Номер',    data.doc_number],
+      ['Дата',     data.doc_date],
+      ['Продавец', data.seller?.name ? (data.seller.name + (data.seller.inn ? ' / ИНН ' + data.seller.inn : '')) : null],
+      ['Покупатель', data.buyer?.name ? (data.buyer.name + (data.buyer.inn ? ' / ИНН ' + data.buyer.inn : '')) : null],
+      ['Договор',  data.contract_ref],
+      ['Итого',    totals.amount_with_vat ? fmt(totals.amount_with_vat) + ' руб.' : null],
+    ].filter(([, v]) => v);
+
+    const itemsHtml = items.length > 0 ? `
+      <div class="doc-card-items">
+        <div class="doc-card-items-title">Позиции (${items.length})</div>
+        <table class="doc-card-items-table">
+          <tr><th>Наименование</th><th>Кол.</th><th>Сумма с НДС</th></tr>
+          ${items.slice(0, 5).map(it =>
+            '<tr><td>' + escHtml(it.name || '') + '</td><td>' + (it.qty || '') + '</td><td style="text-align:right">' + fmt(it.total) + '</td></tr>'
+          ).join('')}
+          ${items.length > 5 ? '<tr><td colspan="3" style="color:#64748b;font-size:0.7rem;">...ещё ' + (items.length - 5) + ' позиций</td></tr>' : ''}
+        </table>
+      </div>` : '';
+
+    const notesHtml = data.notes ? '<div style="margin-top:0.6rem;font-size:0.72rem;color:#94a3b8;border-top:1px solid rgba(255,255,255,0.06);padding-top:0.5rem;">' + escHtml(data.notes) + '</div>' : '';
+
+    return `<div class="doc-card">
+      <div class="doc-card-header">
+        <div class="doc-card-icon">${icon}</div>
+        <div>
+          <div class="doc-card-title">${escHtml(data.doc_name || d.filename)}</div>
+          <div class="doc-card-file">${escHtml(d.filename)}</div>
+          <span class="doc-card-zone ${ZONE_TAG_CSS[zone]}">${ZONE_NAMES[zone]}</span>
+        </div>
+      </div>
+      <div class="doc-card-fields">
+        ${fields.map(([label, val]) =>
+          '<div class="doc-field"><span class="doc-field-label">' + label + ':</span><span class="doc-field-value">' + escHtml(String(val)) + '</span></div>'
+        ).join('')}
+      </div>
+      ${itemsHtml}
+      ${notesHtml}
+    </div>`;
+  }).join('');
+}
+
+const SECTION_STYLES = {
+  payment:   { headerBg: 'rgba(59,130,246,0.15)',  border: 'rgba(59,130,246,0.5)',  icon: '📄', label: 'Документ на оплату' },
+  primary:   { headerBg: 'rgba(100,116,139,0.12)', border: 'rgba(100,116,139,0.4)', icon: '📦', label: 'Первичный документ'  },
+  aggregate: { headerBg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.5)',   icon: '📊', label: 'Итого по первичным'  },
+  extra:     { headerBg: 'rgba(168,85,247,0.12)',  border: 'rgba(168,85,247,0.5)',  icon: '📎', label: 'Доп. документ'       },
+};
+
+function renderSummaryTable(sections) {
+  const wrap = $('summaryTableWrap');
+  if (!sections || !sections.length) {
+    wrap.innerHTML = '<div style="color:#64748b;padding:1rem;">Нет данных для сводной таблицы</div>';
+    return;
+  }
+
+  const cols = ['Наименование товара', 'Ед.', 'Кол-во', 'Цена', 'Без НДС', 'НДС', 'С НДС'];
+
+  let html = '<table class="summary-table"><thead><tr>' +
+    cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+
+  sections.forEach(section => {
+    const st = SECTION_STYLES[section.kind] || SECTION_STYLES.extra;
+
+    html += `<tr class="row-section-header" style="background:${st.headerBg};border-left:3px solid ${st.border};">` +
+      `<td colspan="7" style="padding:0.6rem 0.75rem;">` +
+      `<span style="font-weight:700;font-size:0.85rem;">${st.icon} ${escHtml(section.label)}</span>` +
+      (section.filename ? `<span style="font-size:0.7rem;color:#94a3b8;margin-left:0.75rem;">📄 ${escHtml(section.filename)}</span>` : '') +
+      `</td></tr>`;
+
+    const metaParts = [];
+    if (section.docDate) metaParts.push('Дата: <strong>' + escHtml(section.docDate) + '</strong>');
+    if (section.seller?.name) {
+      const inn = section.seller.inn ? ' (ИНН ' + escHtml(section.seller.inn) + ')' : '';
+      metaParts.push('Поставщик: <strong>' + escHtml(section.seller.name) + inn + '</strong>');
+    }
+    if (section.buyer?.name) {
+      metaParts.push('Получатель: <strong>' + escHtml(section.buyer.name) + '</strong>');
+    }
+    if (section.kind === 'extra') {
+      if (section.issuer)         metaParts.push('Выдан: <strong>' + escHtml(section.issuer) + '</strong>');
+      if (section.validUntil)     metaParts.push('Действует до: <strong>' + escHtml(section.validUntil) + '</strong>');
+      if (section.productName)    metaParts.push('Товар: <strong>' + escHtml(section.productName) + '</strong>');
+      if (section.warrantyMonths) metaParts.push('Гарантия: <strong>' + section.warrantyMonths + ' мес.</strong>');
+      if (section.technicalRegs?.length) metaParts.push('ТР ТС: <strong>' + escHtml(section.technicalRegs.join(', ')) + '</strong>');
+    }
+    if (metaParts.length) {
+      html += `<tr><td colspan="7" style="font-size:0.72rem;color:#94a3b8;padding:0.25rem 0.75rem 0.4rem;border-bottom:1px solid rgba(255,255,255,0.05);">${metaParts.join(' &nbsp;|&nbsp; ')}</td></tr>`;
+    }
+
+    if (section.kind === 'extra') {
+      const rows = [];
+      if (section.claimAmount)  rows.push(['Сумма претензии', fmt(section.claimAmount) + ' руб.']);
+      if (section.claimSubject) rows.push(['Предмет претензии', escHtml(section.claimSubject)]);
+      const sig = section.signatures;
+      if (sig) {
+        const sigStatus  = sig.signed === true ? '✅ Подписан' : sig.signed === false ? '❌ Не подписан' : '';
+        const stmpStatus = sig.stamp  === true ? '✅ Печать есть' : sig.stamp === false ? '⚠️ Без печати' : '';
+        const sigStr = [sigStatus, stmpStatus].filter(Boolean).join(' &nbsp; ');
+        if (sigStr) rows.push(['Подпись / Печать', sigStr]);
+      }
+      if (section.notes) rows.push(['Примечания', escHtml(section.notes)]);
+
+      if (rows.length) {
+        html += rows.map(([label, val]) =>
+          `<tr><td style="color:#94a3b8;font-size:0.75rem;width:160px;">${escHtml(label)}</td>` +
+          `<td colspan="6" style="font-size:0.82rem;">${val}</td></tr>`
+        ).join('');
+      } else {
+        html += '<tr><td colspan="7" class="cell-na">Данные извлечены — см. карточку документа выше</td></tr>';
+      }
+      html += '<tr style="height:8px;background:rgba(0,0,0,0.3);"><td colspan="7"></td></tr>';
+      return;
+    }
+
+    const items = section.items || [];
+    if (items.length) {
+      items.forEach(item => {
+        html += '<tr>' +
+          '<td>' + escHtml(item.name || '') + '</td>' +
+          '<td style="white-space:nowrap;">' + escHtml(item.unit || '') + '</td>' +
+          '<td class="cell-number">' + (item.qty != null ? item.qty : '') + '</td>' +
+          '<td class="cell-number">' + (item.price ? fmt(item.price) : '') + '</td>' +
+          '<td class="cell-number">' + (item.amount ? fmt(item.amount) : '') + '</td>' +
+          '<td class="cell-number">' + (item.vat_amount ? fmt(item.vat_amount) : '') + '</td>' +
+          '<td class="cell-number">' + (item.total ? fmt(item.total) : '') + '</td>' +
+          '</tr>';
+      });
+    } else {
+      html += '<tr><td colspan="7" class="cell-na">Позиции не извлечены</td></tr>';
+    }
+
+    const t = section.totals || {};
+    let compareRow = '';
+    if (section.kind === 'aggregate' && section.compareWith) {
+      const payTotal  = round2(section.compareWith.amount_with_vat || 0);
+      const primTotal = round2(t.amount_with_vat || 0);
+      const diff = round2(Math.abs(payTotal - primTotal));
+      const matchOk = diff < 0.02;
+      const matchCls   = matchOk ? 'cell-match' : 'cell-mismatch';
+      const matchLabel = matchOk
+        ? '✅ Совпадает с документом на оплату'
+        : '🔴 Расхождение с документом на оплату: ' + fmt(diff) + ' руб.';
+      compareRow = `<tr class="row-total" style="background:${matchOk ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)'};font-weight:700;">` +
+        `<td colspan="4" class="${matchCls}">${matchLabel}</td>` +
+        `<td class="cell-number">${payTotal ? fmt(section.compareWith.amount_no_vat || 0) : ''}</td>` +
+        `<td class="cell-number">${payTotal ? fmt(section.compareWith.vat_amount || 0) : ''}</td>` +
+        `<td class="cell-number">${payTotal ? fmt(payTotal) : ''}</td>` +
+        `</tr>`;
+    }
+
+    html += '<tr class="row-total">' +
+      '<td colspan="4" style="font-weight:600;">Итого</td>' +
+      '<td class="cell-number">' + (t.amount_no_vat   ? fmt(t.amount_no_vat)   : '—') + '</td>' +
+      '<td class="cell-number">' + (t.vat_amount       ? fmt(t.vat_amount)       : '—') + '</td>' +
+      '<td class="cell-number">' + (t.amount_with_vat  ? fmt(t.amount_with_vat)  : '—') + '</td>' +
+      '</tr>' + compareRow;
+
+    html += '<tr style="height:8px;background:rgba(0,0,0,0.3);"><td colspan="7"></td></tr>';
+  });
+
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+}
+
+function round2(v) { return Math.round((Number(v) || 0) * 100) / 100; }
+
+function fmt(n) {
+  const num = Number(n);
+  if (!isFinite(num)) return '0,00';
+  const str = String(n);
+  const dotIdx = str.indexOf('.');
+  const srcDecimals = dotIdx >= 0 ? str.length - dotIdx - 1 : 0;
+  const decimals = Math.max(2, Math.min(srcDecimals, 10));
+  return num.toLocaleString('ru-RU', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+const SEV_CONFIG = {
+  critical:    { label: 'Критично',     cls: 'sev-critical',    icon: '🔴', badge: 'badge-critical'    },
+  significant: { label: 'Существенно',  cls: 'sev-significant', icon: '🟠', badge: 'badge-significant' },
+  warning:     { label: 'Замечание',    cls: 'sev-warning',     icon: '🟡', badge: 'badge-warning'     },
+  info:        { label: 'Информация',   cls: 'sev-info',        icon: '🔵', badge: 'badge-info'        },
+};
+
+function renderIssues(issues) {
+  const counts = { critical: 0, significant: 0, warning: 0, info: 0 };
+  issues.forEach(i => { if (counts[i.severity] !== undefined) counts[i.severity]++; });
+
+  $('issueCountBadges').innerHTML = Object.entries(counts)
+    .filter(([, n]) => n > 0)
+    .map(([sev, n]) => {
+      const s = SEV_CONFIG[sev];
+      return '<span class="issue-badge ' + s.badge + '">' + s.icon + ' ' + n + ' ' + s.label + '</span>';
+    }).join('');
+
+  const list = $('issuesList');
+  if (!issues.length) {
+    list.innerHTML = '<div class="no-issues">✅ Программных нарушений не выявлено</div>';
+    return;
+  }
+
+  const byCategory = {};
+  issues.forEach(i => {
+    if (!byCategory[i.category]) byCategory[i.category] = [];
+    byCategory[i.category].push(i);
+  });
+
+  list.innerHTML = Object.entries(byCategory).map(([cat, catIssues]) =>
+    '<div class="issue-group">' +
+    '<div class="issue-group-title">' + escHtml(cat) + '</div>' +
+    catIssues.map(issue => {
+      const s = SEV_CONFIG[issue.severity] || SEV_CONFIG.info;
+      return '<div class="issue-item ' + s.cls + '">' +
+        '<span class="issue-icon">' + s.icon + '</span>' +
+        '<div class="issue-body">' +
+        '<div class="issue-msg">' + escHtml(issue.message) + '</div>' +
+        (issue.detail ? '<div class="issue-detail">' + escHtml(issue.detail) + '</div>' : '') +
+        '</div></div>';
+    }).join('') +
+    '</div>'
+  ).join('');
+}
+
+// ─── Скачать архив ────────────────────────────────────────────────────────────
+
+async function downloadArchive() {
+  if (!results) return;
+
+  const btn = $('downloadArchiveBtn');
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Формирую архив...';
+
+  try {
+    const slug = dateSlug();
+    const [XLSX, JSZip] = await Promise.all([loadXLSX(), loadJSZip()]);
+    const zip = new JSZip();
+
+    try {
+      const printHtml = injectPrintStyles(buildReportHtml());
+      zip.file('report-' + slug + '.html', new Blob([printHtml], { type: 'text/html;charset=utf-8' }));
+      openPrintWindow(printHtml);
+    } catch (e) { console.warn('PDF step failed:', e); }
+
+    try {
+      const rtf = buildRtfReport();
+      zip.file('report-' + slug + '.rtf', new Blob([rtf], { type: 'application/rtf' }));
+    } catch (e) { console.warn('RTF step failed:', e); }
+
+    try {
+      zip.file('table-' + slug + '.xlsx', buildExcelBlob(XLSX));
+    } catch (e) { console.warn('Excel step failed:', e); }
+
+    const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    triggerDownload(zipBlob, 'doc-check-' + slug + '.zip');
+    showToast('✅ Архив скачан (HTML+RTF+Excel). Для PDF откройте report-*.html и нажмите Ctrl+P → Сохранить как PDF', 'success', 7000);
+
+  } catch (err) {
+    console.error('Archive error:', err);
+    showToast('Ошибка: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function openPrintWindow(htmlContent) {
+  const w = window.open('', '_blank', 'width=960,height=800');
+  if (!w) { showToast('Разрешите всплывающие окна для печати PDF', 'warning'); return; }
+  w.document.open();
+  w.document.write(htmlContent);
+  w.document.close();
+  w.focus();
+  setTimeout(() => { try { w.print(); } catch(e) { /* ignore */ } }, 900);
+}
+
+function injectPrintStyles(html) {
+  const printCss = `
+    <style>
+      @media print {
+        body { background: #fff !important; color: #000 !important; font-family: Arial, sans-serif; font-size: 11pt; }
+        .upload-grid, .actions-row, .progress-card, #confirmOverlay, .toast-container,
+        .hint-block, .prompt-card, .download-row { display: none !important; }
+        .summary-table th { background: #e8f4f8 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        .row-section-header td { background: #f0f0f0 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        .row-total td { background: #e8e8e8 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        .issue-item { border-left: 3px solid #999 !important; background: #f9f9f9 !important; }
+        * { color: #000 !important; }
+        @page { margin: 15mm; }
+      }
+    </style>`;
+  return html.replace('</head>', printCss + '</head>');
+}
+
+function buildSummaryHtmlTable(summaryData) {
+  if (!summaryData?.length) return '';
+  let html = '<h2>Сводная таблица</h2>' +
+    '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px;">' +
+    '<tr style="background:#e8f4f8;"><th>Наименование товара</th><th>Ед.</th><th>Кол-во</th><th>Цена</th><th>Без НДС</th><th>НДС</th><th>С НДС</th></tr>';
+
+  summaryData.forEach(section => {
+    const bg = { payment: '#dbeafe', primary: '#f1f5f9', aggregate: '#dcfce7', extra: '#f5f0ff' }[section.kind] || '#f1f5f9';
+    html += '<tr style="background:' + bg + ';font-weight:bold;"><td colspan="7">' + escHtml(section.label) + '</td></tr>';
+    const meta = [];
+    if (section.docDate) meta.push('Дата: ' + section.docDate);
+    if (section.seller?.name) meta.push('Поставщик: ' + section.seller.name);
+    if (section.buyer?.name) meta.push('Получатель: ' + section.buyer.name);
+    if (section.issuer) meta.push('Выдан: ' + section.issuer);
+    if (section.validUntil) meta.push('Действует до: ' + section.validUntil);
+    if (meta.length) html += '<tr style="background:' + bg + ';"><td colspan="7" style="font-size:11px;color:#555;">' + escHtml(meta.join(' | ')) + '</td></tr>';
+
+    if (section.kind === 'extra') {
+      if (section.claimAmount)  html += '<tr><td>Сумма претензии</td><td colspan="6">' + fmt(section.claimAmount) + ' руб.</td></tr>';
+      if (section.claimSubject) html += '<tr><td>Предмет претензии</td><td colspan="6">' + escHtml(section.claimSubject) + '</td></tr>';
+      if (section.notes) html += '<tr><td>Примечания</td><td colspan="6">' + escHtml(section.notes) + '</td></tr>';
+      return;
+    }
+
+    (section.items || []).forEach(item => {
+      html += '<tr>' +
+        '<td>' + escHtml(item.name || '') + '</td><td>' + escHtml(item.unit || '') + '</td>' +
+        '<td align="right">' + (item.qty != null ? item.qty : '') + '</td>' +
+        '<td align="right">' + (item.price ? fmt(item.price) : '') + '</td>' +
+        '<td align="right">' + (item.amount ? fmt(item.amount) : '') + '</td>' +
+        '<td align="right">' + (item.vat_amount ? fmt(item.vat_amount) : '') + '</td>' +
+        '<td align="right">' + (item.total ? fmt(item.total) : '') + '</td></tr>';
+    });
+
+    const t = section.totals || {};
+    html += '<tr style="background:#f0f0f0;font-weight:bold;"><td colspan="4">Итого</td>' +
+      '<td align="right">' + (t.amount_no_vat ? fmt(t.amount_no_vat) : '') + '</td>' +
+      '<td align="right">' + (t.vat_amount ? fmt(t.vat_amount) : '') + '</td>' +
+      '<td align="right">' + (t.amount_with_vat ? fmt(t.amount_with_vat) : '') + '</td></tr>';
+
+    if (section.kind === 'aggregate' && section.compareWith) {
+      const diff = round2(Math.abs((t.amount_with_vat || 0) - (section.compareWith.amount_with_vat || 0)));
+      const ok = diff < 0.02;
+      html += '<tr style="background:' + (ok ? '#f0fff4' : '#fff5f5') + ';font-weight:bold;">' +
+        '<td colspan="4">' + (ok ? '✅ Совпадает' : '🔴 Расхождение: ' + fmt(diff) + ' руб.') + '</td>' +
+        '<td align="right">' + fmt(section.compareWith.amount_no_vat || 0) + '</td>' +
+        '<td align="right">' + fmt(section.compareWith.vat_amount || 0) + '</td>' +
+        '<td align="right">' + fmt(section.compareWith.amount_with_vat || 0) + '</td></tr>';
+    }
+  });
+
+  return html + '</table>';
+}
+
+function buildReportHtml() {
+  if (!results) return '';
+  const { issues, conclusion, documents, summaryData } = results;
+  const date = new Date().toLocaleString('ru-RU');
+  const critCount = issues.filter(i => i.severity === 'critical').length;
+  const sigCount  = issues.filter(i => i.severity === 'significant').length;
+
+  return `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Отчёт проверки — ${date}</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 20px; color: #222; font-size: 14px; }
+  h1 { color: #1a1a2e; border-bottom: 2px solid #4a90d9; padding-bottom: 10px; }
+  h2 { color: #2c3e50; margin-top: 30px; font-size: 16px; }
+  .meta { color: #666; font-size: 13px; margin-bottom: 20px; }
+  .issue { padding: 8px 12px; margin: 6px 0; border-radius: 4px; border-left: 4px solid; }
+  .issue.critical    { background: #fff5f5; border-color: #e53e3e; }
+  .issue.significant { background: #fffaf0; border-color: #dd6b20; }
+  .issue.warning     { background: #fffff0; border-color: #d69e2e; }
+  .issue.info        { background: #ebf8ff; border-color: #3182ce; }
+  .issue-msg    { font-weight: bold; margin-bottom: 3px; }
+  .issue-detail { font-size: 12px; color: #555; }
+  .conclusion { background: #f7f9fc; border: 1px solid #ddd; border-radius: 6px; padding: 20px; white-space: pre-wrap; line-height: 1.7; }
+  .no-issues  { color: #38a169; font-weight: bold; padding: 12px; background: #f0fff4; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>📋 Отчёт проверки пакета документов на оплату</h1>
+<p class="meta">Дата: ${date} | Документов: ${documents.length} | Критических нарушений: ${critCount} | Существенных: ${sigCount}</p>
+<h2>Проверенные документы</h2>
+<div style="background:#f8f9fa;border-radius:6px;padding:12px;margin-bottom:16px;">
+${documents.map(d => '<div style="padding:4px 0;border-bottom:1px solid #e9ecef;font-size:13px;">' + getTypeIcon(d.type) + ' <strong>' + escHtml(d.filename) + '</strong> — ' + getTypeLabel(d.type) + '</div>').join('')}
+</div>
+${buildSummaryHtmlTable(summaryData)}
+<h2>Программные проверки (${issues.length} нарушений)</h2>
+${issues.length === 0
+  ? '<div class="no-issues">✅ Нарушений не выявлено</div>'
+  : issues.map(i => '<div class="issue ' + i.severity + '"><div class="issue-msg">' + escHtml(i.message) + '</div>' + (i.detail ? '<div class="issue-detail">' + escHtml(i.detail) + '</div>' : '') + '</div>').join('')}
+<h2>Заключение AI (Claude)</h2>
+<div class="conclusion">${escHtml(conclusion)}</div>
+</body>
+</html>`;
+}
+
+function buildExcelBlob(XLSX) {
+  const { summaryData, issues } = results;
+  const wb = XLSX.utils.book_new();
+
+  const tableRows = [];
+  const merges    = [];
+  tableRows.push(['Наименование товара', 'Ед.', 'Кол-во', 'Цена', 'Без НДС', 'НДС', 'С НДС']);
+
+  (summaryData || []).forEach(section => {
+    const sectionRow = tableRows.length;
+    tableRows.push([section.label, '', '', '', '', '', '']);
+    merges.push({ s: { r: sectionRow, c: 0 }, e: { r: sectionRow, c: 6 } });
+
+    const meta = [];
+    if (section.docDate) meta.push('Дата: ' + section.docDate);
+    if (section.seller?.name) meta.push('Поставщик: ' + section.seller.name);
+    if (section.buyer?.name)  meta.push('Получатель: ' + section.buyer.name);
+    if (meta.length) {
+      const mr = tableRows.length;
+      tableRows.push([meta.join(' | '), '', '', '', '', '', '']);
+      merges.push({ s: { r: mr, c: 0 }, e: { r: mr, c: 6 } });
+    }
+
+    if (section.kind === 'extra') {
+      if (section.claimAmount)  tableRows.push(['Сумма претензии', '', '', '', '', '', fmt(section.claimAmount) + ' руб.']);
+      if (section.claimSubject) tableRows.push(['Предмет претензии', section.claimSubject, '', '', '', '', '']);
+      if (section.notes) tableRows.push(['Примечания', section.notes, '', '', '', '', '']);
+      tableRows.push(['', '', '', '', '', '', '']);
+      return;
+    }
+
+    (section.items || []).forEach(item => {
+      tableRows.push([item.name||'', item.unit||'', item.qty!=null?item.qty:'',
+        item.price?Number(item.price):'', item.amount?Number(item.amount):'',
+        item.vat_amount?Number(item.vat_amount):'', item.total?Number(item.total):'']);
+    });
+
+    const t = section.totals || {};
+    const tr = tableRows.length;
+    tableRows.push(['Итого','','','',
+      t.amount_no_vat?Number(t.amount_no_vat):'',
+      t.vat_amount?Number(t.vat_amount):'',
+      t.amount_with_vat?Number(t.amount_with_vat):'']);
+    merges.push({ s: { r: tr, c: 0 }, e: { r: tr, c: 3 } });
+
+    if (section.kind === 'aggregate' && section.compareWith) {
+      const diff = round2(Math.abs((t.amount_with_vat||0)-(section.compareWith.amount_with_vat||0)));
+      const cr = tableRows.length;
+      tableRows.push([diff<0.02?'✅ Совпадает':'🔴 Расхождение: '+fmt(diff)+' руб.','','','',
+        section.compareWith.amount_no_vat?Number(section.compareWith.amount_no_vat):'',
+        section.compareWith.vat_amount?Number(section.compareWith.vat_amount):'',
+        section.compareWith.amount_with_vat?Number(section.compareWith.amount_with_vat):'']);
+      merges.push({ s: { r: cr, c: 0 }, e: { r: cr, c: 3 } });
+    }
+    tableRows.push(['','','','','','','']);
+  });
+
+  const ws1 = XLSX.utils.aoa_to_sheet(tableRows);
+  ws1['!merges'] = merges;
+  ws1['!cols'] = [{ wch: 45 }, { wch: 6 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 14 }];
+  XLSX.utils.book_append_sheet(wb, ws1, 'Сводная таблица');
+
+  const SEV_RU    = { critical: 'Критично', significant: 'Существенно', warning: 'Замечание', info: 'Информация' };
+  const issueRows = [['Категория', 'Уровень', 'Нарушение', 'Детали']];
+  (issues || []).forEach(i => {
+    issueRows.push([i.category||'', SEV_RU[i.severity]||i.severity, i.message||'', i.detail||'']);
+  });
+  const ws2 = XLSX.utils.aoa_to_sheet(issueRows);
+  ws2['!cols'] = [{ wch: 22 }, { wch: 14 }, { wch: 60 }, { wch: 50 }];
+  XLSX.utils.book_append_sheet(wb, ws2, 'Нарушения');
+
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  return new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+async function loadXLSX() {
+  if (window.XLSX) return window.XLSX;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    s.onload = resolve;
+    s.onerror = () => {
+      const s2 = document.createElement('script');
+      s2.src = 'https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js';
+      s2.onload = resolve; s2.onerror = reject;
+      document.head.appendChild(s2);
+    };
+    document.head.appendChild(s);
+  });
+  return window.XLSX;
+}
+
+function buildRtfReport() {
+  const { issues, conclusion, documents, summaryData } = results;
+  const date = new Date().toLocaleString('ru-RU');
+
+  function rtfStr(s) {
+    return (s || '').replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}')
+      .replace(/[^\u0000-\u007F]/g, ch => {
+        const code = ch.charCodeAt(0);
+        return '\\u' + (code > 32767 ? code - 65536 : code) + '?';
+      });
+  }
+  function h1(s)  { return '{\\pard\\sb240\\sa120\\b\\fs32 ' + rtfStr(s) + '\\b0\\par}\n'; }
+  function h2(s)  { return '{\\pard\\sb200\\sa80\\b\\fs26 ' + rtfStr(s) + '\\b0\\par}\n'; }
+  function para(s) { return '{\\pard\\sa80 ' + rtfStr(s) + '\\par}\n'; }
+
+  function tblRow(cells, widths, shading) {
+    const W = widths || [5000, 800, 1000, 1500, 1800, 1500, 1800];
+    let hdr = '\\trowd\\trgaph108\\trleft-108';
+    let pos = 0;
+    W.forEach(w => { pos += w; hdr += (shading ? '\\clcbpat' + shading : '') + '\\cellx' + pos; });
+    const body = cells.map(c => '{\\pard\\intbl\\sa0 ' + rtfStr(String(c ?? '')) + '\\cell}').join('');
+    return hdr + '\n' + body + '\\row\n';
+  }
+
+  let rtf = '{\\rtf1\\ansi\\ansicpg1251\\deff0\n';
+  rtf += '{\\fonttbl{\\f0\\froman\\fcharset204 Times New Roman;}{\\f1\\fswiss\\fcharset204 Arial;}}\n';
+  rtf += '{\\colortbl;\\red0\\green0\\blue0;\\red220\\green53\\blue53;\\red221\\green107\\blue32;\\red215\\green158\\blue46;\\red2\\green132\\blue199;\\red22\\green163\\blue74;}\n';
+  rtf += '\\f1\\fs22\\lang1049\n';
+  rtf += h1('Отчёт проверки пакета документов на оплату');
+  rtf += para('Дата: ' + date + ' | Документов: ' + documents.length);
+
+  rtf += h2('Проверенные документы');
+  documents.forEach(d => { rtf += para(d.filename + ' — ' + getTypeLabel(d.type)); });
+
+  rtf += h2('Сводная таблица');
+  const COL_W = [4200, 500, 700, 1200, 1400, 1200, 1400];
+  rtf += tblRow(['Наименование товара','Ед.','Кол.','Цена','Без НДС','НДС','С НДС'], COL_W, 13421772);
+
+  (summaryData || []).forEach(section => {
+    rtf += tblRow([section.label,'','','','','',''], COL_W, 14540253);
+    const meta = [];
+    if (section.docDate) meta.push('Дата: ' + section.docDate);
+    if (section.seller?.name) meta.push('Поставщик: ' + section.seller.name);
+    if (section.buyer?.name)  meta.push('Получатель: ' + section.buyer.name);
+    if (meta.length) rtf += tblRow([meta.join(' | '),'','','','','',''], COL_W);
+
+    if (section.kind === 'extra') {
+      if (section.claimAmount)  rtf += tblRow(['Сумма претензии','','','','','',fmt(section.claimAmount)+' руб.'], COL_W);
+      if (section.claimSubject) rtf += tblRow(['Предмет: '+(section.claimSubject||''),'','','','','',''], COL_W);
+      if (section.notes)        rtf += tblRow(['Примечания: '+section.notes,'','','','','',''], COL_W);
+      return;
+    }
+
+    (section.items || []).forEach(item => {
+      rtf += tblRow([item.name||'', item.unit||'',
+        item.qty!=null?String(item.qty):'',
+        item.price?fmt(item.price):'',
+        item.amount?fmt(item.amount):'',
+        item.vat_amount?fmt(item.vat_amount):'',
+        item.total?fmt(item.total):''], COL_W);
+    });
+
+    const t = section.totals || {};
+    rtf += tblRow(['Итого','','','',
+      t.amount_no_vat?fmt(t.amount_no_vat):'',
+      t.vat_amount?fmt(t.vat_amount):'',
+      t.amount_with_vat?fmt(t.amount_with_vat):''], COL_W, 14737632);
+
+    if (section.kind === 'aggregate' && section.compareWith) {
+      const diff = round2(Math.abs((t.amount_with_vat||0)-(section.compareWith.amount_with_vat||0)));
+      const ok = diff < 0.02;
+      rtf += tblRow([ok?'Совпадает':'Расхождение: '+fmt(diff)+' руб.','','','',
+        fmt(section.compareWith.amount_no_vat||0),
+        fmt(section.compareWith.vat_amount||0),
+        fmt(section.compareWith.amount_with_vat||0)], COL_W, ok?13828096:16744448);
+    }
+  });
+
+  rtf += h2('Нарушения (' + issues.length + ')');
+  const SEV_RU = { critical: 'КРИТИЧНО', significant: 'СУЩЕСТВЕННО', warning: 'ЗАМЕЧАНИЕ', info: 'ИНФО' };
+  const SEV_CF = { critical: '\\cf2', significant: '\\cf3', warning: '\\cf4', info: '\\cf5' };
+  if (!issues.length) {
+    rtf += para('Нарушений не выявлено');
+  } else {
+    issues.forEach(issue => {
+      const cf = SEV_CF[issue.severity] || '';
+      rtf += '{\\pard\\sa60 ' + cf + '{\\b [' + rtfStr(SEV_RU[issue.severity]||issue.severity) + ']} \\cf0' +
+        (issue.category?' '+rtfStr(issue.category)+':':'') + ' {\\b ' + rtfStr(issue.message) + '}\\par}\n';
+      if (issue.detail) rtf += '{\\pard\\sa80\\li360\\fs18\\cf0 ' + rtfStr(issue.detail) + '\\par}\n';
+    });
+  }
+
+  rtf += h2('Заключение AI (Claude)');
+  (conclusion||'').split(/\n\n+/).forEach(p => {
+    if (!p.trim()) return;
+    rtf += para(p.replace(/^#{1,4}\s+/,'').replace(/\*\*/g,'').replace(/\*/g,''));
+  });
+
+  rtf += '}';
+  return rtf;
+}
+
+async function loadJSZip() {
+  if (window.JSZip) return window.JSZip;
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js')
+    .catch(() => loadScript('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'));
+  if (!window.JSZip) throw new Error('JSZip не загружен');
+  return window.JSZip;
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+function dateSlug() { return new Date().toISOString().slice(0, 10); }
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function setProgress(pct, stage, detail) {
+  if (pct !== null) {
+    $('progressBar').style.width = pct + '%';
+    $('progressBar').setAttribute('aria-valuenow', pct);
+  }
+  if (stage)  $('progressStageLabel').textContent = stage;
+  if (detail) $('progressText').textContent = detail;
+}
+
+function markdownToHtml(text) {
+  return (text || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/^(?!<[hul])(.+)$/gm, '<p>$1</p>')
+    .replace(/<p><\/p>/g, '');
+}
+
+function escHtml(str) {
+  return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function showToast(message, type = 'info', duration = 4500) {
+  const container = $('toastContainer');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = 'toast toast-' + type;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), duration);
+}
+
+// ─── Система паттернов ────────────────────────────────────────────────────────
+
+const PATTERNS_KEY = 'doc_checker_patterns_v1';
+let _userPatterns = [];
+
+function loadUserPatterns() {
+  try { const raw = sessionStorage.getItem(PATTERNS_KEY); _userPatterns = raw ? JSON.parse(raw) : []; } catch { _userPatterns = []; }
+  updatePatternsBadge();
+}
+
+function saveUserPatterns() {
+  try { sessionStorage.setItem(PATTERNS_KEY, JSON.stringify(_userPatterns)); } catch { /* */ }
+  updatePatternsBadge();
+}
+
+function updatePatternsBadge() {
+  const badge = $('patternsBadge');
+  if (badge) badge.textContent = _userPatterns.length > 0 ? String(_userPatterns.length) : '';
+}
+
+export function getUserPatternsPrompt() {
+  if (!_userPatterns.length) return '';
+  const lines = _userPatterns.map((p, i) =>
+    `Паттерн ${i + 1} (${p.source}, поле ${p.field}):\n  Неверно: ${p.example_wrong}\n  Верно:   ${p.example_correct}\n  Правило: ${p.rule}`
+  ).join('\n\n');
+  return '\n\nПОЛЬЗОВАТЕЛЬСКИЕ ПАТТЕРНЫ ОШИБОК (выявлены на предыдущих анализах):\n' + lines + '\n\nОБЯЗАТЕЛЬНО учти эти паттерны при извлечении данных!';
+}
+
+function openFeedback(issueMsg) {
+  $('fbDocFile').value  = allFiles().map(f => f.name).join(', ') || '';
+  $('fbWrong').value    = '';
+  $('fbCorrect').value  = '';
+  $('fbContext').value  = issueMsg || '';
+  $('fbField').value    = 'price';
+  $('fbPatternPreview').classList.add('hidden');
+  $('feedbackOverlay').classList.remove('hidden');
+  setTimeout(() => $('fbWrong').focus(), 100);
+}
+
+function closeFeedback() { $('feedbackOverlay').classList.add('hidden'); }
+
+function updatePatternPreview() {
+  const wrong = $('fbWrong').value.trim(), correct = $('fbCorrect').value.trim();
+  if (!wrong || !correct) { $('fbPatternPreview').classList.add('hidden'); return; }
+  $('fbPatternJson').textContent = JSON.stringify(buildPatternFromForm(), null, 2);
+  $('fbPatternPreview').classList.remove('hidden');
+}
+
+function buildPatternFromForm() {
+  return {
+    id: 'user_' + Date.now(), source: 'Пользователь — ' + new Date().toLocaleDateString('ru-RU'),
+    doc_type: 'auto', field: $('fbField').value,
+    example_wrong: $('fbWrong').value.trim(), example_correct: $('fbCorrect').value.trim(),
+    rule: $('fbContext').value.trim() || `Поле "${$('fbField').value}": вместо "${$('fbWrong').value.trim()}" должно быть "${$('fbCorrect').value.trim()}"`,
+    added_by: 'user', added_at: new Date().toISOString().slice(0, 10),
+  };
+}
+
+function saveFeedbackPattern() {
+  if (!$('fbWrong').value.trim() || !$('fbCorrect').value.trim()) { showToast('Заполните поля «Что прочитано» и «Как должно быть»', 'warning'); return; }
+  _userPatterns.push(buildPatternFromForm());
+  saveUserPatterns();
+  closeFeedback();
+  showToast('✅ Паттерн сохранён. Будет учтён при следующем анализе.', 'success', 5000);
+}
+
+function openPatternsModal() { renderPatternsList(); $('patternsOverlay').classList.remove('hidden'); }
+
+function renderPatternsList() {
+  const wrap = $('patternsListWrap'); if (!wrap) return;
+  const systemPatterns = [{ id: 'sys_1', source: 'УПД ФНС — цена', field: 'price', added_by: 'system', rule: 'PDF разбивает цену на части. Пример: «238 352,31 05269930» = 238352.3105269930. НЕ обрезать после 2 знаков.', example_wrong: '238352.31', example_correct: '238352.3105269930' }];
+  const all = [...systemPatterns, ..._userPatterns];
+  if (!all.length) { wrap.innerHTML = '<div class="patterns-empty">Паттернов пока нет</div>'; return; }
+  wrap.innerHTML = all.map(p => {
+    const isUser = p.added_by === 'user';
+    return '<div class="pattern-item ' + (isUser ? 'pattern-user' : 'pattern-system') + '">' +
+      '<div class="pattern-item-header"><span class="pattern-item-source">' + escHtml(p.source) + ' — поле: ' + escHtml(p.field) + '</span>' +
+      '<div style="display:flex;gap:0.4rem;align-items:center;"><span class="pattern-item-badge ' + (isUser ? 'pattern-badge-user' : 'pattern-badge-system') + '">' + (isUser ? '👤 Пользователь' : '⚙️ Системный') + '</span>' +
+      (isUser ? '<button class="pattern-item-delete" data-pattern-id="' + escHtml(p.id) + '" title="Удалить">✕</button>' : '') + '</div></div>' +
+      '<div class="pattern-item-rule">' + escHtml(p.rule) + '</div>' +
+      (p.example_wrong && p.example_correct ? '<div class="pattern-item-example"><span class="pattern-ex-wrong">' + escHtml(p.example_wrong) + '</span><span class="pattern-ex-arrow">→</span><span class="pattern-ex-correct">' + escHtml(p.example_correct) + '</span></div>' : '') +
+    '</div>';
+  }).join('');
+  wrap.addEventListener('click', e => { const btn = e.target.closest('.pattern-item-delete'); if (!btn) return; _userPatterns = _userPatterns.filter(p => p.id !== btn.dataset.patternId); saveUserPatterns(); renderPatternsList(); showToast('Паттерн удалён', 'info'); });
+}
+
+function clearUserPatterns() {
+  if (!_userPatterns.length) { showToast('Пользовательских паттернов нет', 'info'); return; }
+  if (!confirm('Удалить все ' + _userPatterns.length + ' пользовательских паттернов?')) return;
+  _userPatterns = []; saveUserPatterns(); renderPatternsList(); showToast('Пользовательские паттерны очищены', 'success');
+}
+

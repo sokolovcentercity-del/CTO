@@ -1,0 +1,13 @@
+Options -Indexes
+DirectoryIndex index.php
+
+<Files "*.json">
+    Order Deny,Allow
+    Deny from all
+</Files>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>

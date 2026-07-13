@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Экспорт файлов Doc-Checker</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Inter, system-ui, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+    .card {
+      background: #1e293b;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 1.25rem;
+      padding: 2rem;
+      max-width: 600px;
+      width: 100%;
+    }
+    h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .subtitle { color: #94a3b8; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .file-list {
+      background: #0f172a;
+      border-radius: 0.75rem;
+      padding: 0.75rem;
+      margin-bottom: 1.5rem;
+      max-height: 320px;
+      overflow-y: auto;
+      font-size: 0.8rem;
+    }
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.5rem;
+      border-radius: 0.4rem;
+    }
+    .file-row:hover { background: rgba(255,255,255,0.04); }
+    .file-row .name { flex: 1; color: #cbd5e1; }
+    .file-row .status { width: 100px; text-align: right; font-size: 0.72rem; white-space: nowrap; }
+    .status-ok    { color: #4ade80; }
+    .status-err   { color: #f87171; }
+    .status-wait  { color: #94a3b8; }
+    .status-skip  { color: #64748b; }
+    .progress-wrap { margin-bottom: 1.5rem; }
+    .progress-label { font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.4rem; }
+    .progress-track {
+      background: rgba(255,255,255,0.08);
+      border-radius: 99px;
+      height: 8px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #06b6d4, #22d3ee);
+      border-radius: 99px;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.7rem 1.5rem;
+      border-radius: 0.75rem;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      transition: opacity 0.2s;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg, #06b6d4, #22d3ee);
+      color: #000;
+    }
+    .btn-secondary {
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: #e2e8f0;
+    }
+    .btn-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .log {
+      background: #0f172a;
+      border-radius: 0.75rem;
+      padding: 0.75rem;
+      font-size: 0.75rem;
+      color: #64748b;
+      max-height: 120px;
+      overflow-y: auto;
+      margin-top: 1rem;
+      display: none;
+    }
+    .log.visible { display: block; }
+    .log-line { padding: 0.15rem 0; }
+    .log-line.ok   { color: #4ade80; }
+    .log-line.err  { color: #f87171; }
+    .log-line.info { color: #94a3b8; }
+    .summary {
+      margin-top: 1rem;
+      padding: 0.75rem 1rem;
+      border-radius: 0.75rem;
+      font-size: 0.85rem;
+      display: none;
+    }
+    .summary.ok  { background: rgba(74,222,128,0.1);  border: 1px solid rgba(74,222,128,0.3);  color: #4ade80; }
+    .summary.err { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: #f87171; }
+    .summary.warn{ background: rgba(234,179,8,0.1);   border: 1px solid rgba(234,179,8,0.3);   color: #fbbf24; }
+    .api-note {
+      background: rgba(234,179,8,0.08);
+      border: 1px solid rgba(234,179,8,0.25);
+      border-radius: 0.75rem;
+      padding: 0.75rem 1rem;
+      font-size: 0.78rem;
+      color: #fbbf24;
+      margin-bottom: 1.25rem;
+      line-height: 1.6;
+    }
+    .section-label {
+      color: #64748b;
+      font-size: 0.72rem;
+      padding: 0.3rem 0.5rem;
+      margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>📦 Экспорт файлов Doc-Checker</h1>
+  <p class="subtitle">Скачивает файлы модуля doc-checker в ZIP-архив для загрузки на сервер</p>
+
+  <div class="api-note">
+    ⚠️ <strong>api/config.php</strong> не включён в архив — там ваш API-ключ. Не перезаписывайте его на сервере.<br><br>
+    📂 Все файлы архива кладутся в папку <strong>doc-checker/</strong> на сервере.<br>
+    Файлы основного приложения (index.html, main.js) обновляются отдельно через «📦 Скачать файлы проекта» в главном меню.<br><br>
+    ℹ️ <strong>Два режима:</strong> в miniapps.ai превью — через SDK (без сервера), на сервере — через handler.php (Claude или Yandex из config.php).
+  </div>
+
+  <div class="file-list" id="fileList">
+    <!-- заполняется JS -->
+  </div>
+
+  <div class="progress-wrap" id="progressWrap" style="display:none">
+    <div class="progress-label" id="progressLabel">Загрузка файлов...</div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" id="downloadBtn" disabled>
+      <span>⬇️</span><span>Скачать ZIP</span>
+    </button>
+    <button class="btn btn-secondary" id="refreshBtn">
+      <span>🔄</span><span>Обновить</span>
+    </button>
+  </div>
+
+  <div class="log" id="logEl"></div>
+  <div class="summary" id="summaryEl"></div>
+</div>
+
+<script>
+// ─── Список файлов doc-checker (все пути относительно этой папки) ─────────────
+const FILES = [
+  'index.html',
+  'main.js',
+  'core.js',
+  'ui.js',
+  'styles.css',
+  'pdf-processor.js',
+  'patterns.json',
+  'simple.html',
+  'README.md',
+  'api/.htaccess',
+  'api/handler.php',
+  // api/config.php намеренно НЕ включён (содержит API-ключи)
+];
+
+// ─── PDF.js: скачиваем с CDN и кладём в libs/ ────────────────────────────────
+// Это решает проблему заблокированных CDN на хостинге (Beget, Россия).
+// После распаковки архива: doc-checker/libs/pdf.min.js и pdf.worker.min.js
+const PDFJS_VERSION = '3.11.174';
+const PDFJS_LIBS = [
+  {
+    path: 'libs/pdf.min.js',
+    urls: [
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + PDFJS_VERSION + '/pdf.min.js',
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + PDFJS_VERSION + '/build/pdf.min.js',
+      'https://unpkg.com/pdfjs-dist@' + PDFJS_VERSION + '/build/pdf.min.js',
+    ],
+  },
+  {
+    path: 'libs/pdf.worker.min.js',
+    urls: [
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + PDFJS_VERSION + '/pdf.worker.min.js',
+      'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + PDFJS_VERSION + '/build/pdf.worker.min.js',
+      'https://unpkg.com/pdfjs-dist@' + PDFJS_VERSION + '/build/pdf.worker.min.js',
+    ],
+  },
+];
+
+// ─── Состояние ────────────────────────────────────────────────────────────────
+function buildFileStatuses() {
+  const regular = FILES.map(path => ({
+    path,
+    fetchUrl: './' + path,
+    status: 'wait', size: null, blob: null, error: null,
+    isCdn: false,
+  }));
+  const cdnLibs = PDFJS_LIBS.map(lib => ({
+    path: lib.path,
+    fetchUrl: null,   // URL выбирается динамически из urls[]
+    cdnUrls: lib.urls,
+    status: 'wait', size: null, blob: null, error: null,
+    isCdn: true,
+  }));
+  return [...regular, ...cdnLibs];
+}
+let fileStatuses = buildFileStatuses();
+
+// ─── DOM ─────────────────────────────────────────────────────────────────────
+const fileListEl    = document.getElementById('fileList');
+const progressWrap  = document.getElementById('progressWrap');
+const progressFill  = document.getElementById('progressFill');
+const progressLabel = document.getElementById('progressLabel');
+const logEl         = document.getElementById('logEl');
+const summaryEl     = document.getElementById('summaryEl');
+const downloadBtn   = document.getElementById('downloadBtn');
+const refreshBtn    = document.getElementById('refreshBtn');
+
+// ─── Рендер списка ────────────────────────────────────────────────────────────
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return bytes + ' Б';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+  return (bytes / 1024 / 1024).toFixed(2) + ' МБ';
+}
+
+function renderFileList() {
+  function rowHtml(f) {
+    let statusHtml;
+    if      (f.status === 'ok')   statusHtml = '<span class="status status-ok">✓ ' + fmtSize(f.size) + '</span>';
+    else if (f.status === 'err')  statusHtml = '<span class="status status-err">✕ ошибка</span>';
+    else if (f.status === 'load') statusHtml = '<span class="status status-wait">загрузка…</span>';
+    else                          statusHtml = '<span class="status status-wait">ожидает</span>';
+    return '<div class="file-row">' +
+      '<span>📄</span>' +
+      '<span class="name">' + f.path + '</span>' +
+      statusHtml +
+      '</div>';
+  }
+  const regularFiles = fileStatuses.filter(f => !f.isCdn);
+  const cdnFiles     = fileStatuses.filter(f => f.isCdn);
+  fileListEl.innerHTML =
+    '<div class="section-label">📁 doc-checker/ — файлы приложения</div>' +
+    regularFiles.map(rowHtml).join('') +
+    '<div class="section-label">📦 doc-checker/libs/ — PDF.js локально (обход блокировки CDN)</div>' +
+    cdnFiles.map(rowHtml).join('');
+}
+
+function log(msg, type = 'info') {
+  logEl.classList.add('visible');
+  const line = document.createElement('div');
+  line.className = 'log-line ' + type;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ─── Загрузка файлов ──────────────────────────────────────────────────────────
+async function fetchAllFiles() {
+  fileStatuses = buildFileStatuses();
+  logEl.innerHTML = '';
+  logEl.classList.remove('visible');
+  summaryEl.style.display = 'none';
+  progressWrap.style.display = 'block';
+  downloadBtn.disabled = true;
+  refreshBtn.disabled = true;
+  renderFileList();
+
+  let ok = 0, err = 0;
+
+  for (let i = 0; i < fileStatuses.length; i++) {
+    const f = fileStatuses[i];
+    f.status = 'load';
+    renderFileList();
+    progressLabel.textContent = 'Загрузка: ' + f.path + ' (' + (i + 1) + '/' + fileStatuses.length + ')';
+    progressFill.style.width = Math.round((i / fileStatuses.length) * 100) + '%';
+
+    try {
+      if (f.isCdn) {
+        // CDN-файл: перебираем URL до первого успеха
+        let loaded = false;
+        for (const url of f.cdnUrls) {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            f.blob   = blob;
+            f.size   = blob.size;
+            f.status = 'ok';
+            ok++;
+            log('✓ ' + f.path + ' ← ' + new URL(url).hostname + ' (' + fmtSize(f.size) + ')', 'ok');
+            loaded = true;
+            break;
+          } catch (cdnErr) {
+            log('  ⚠ ' + new URL(url).hostname + ': ' + cdnErr.message, 'info');
+          }
+        }
+        if (!loaded) throw new Error('Все CDN недоступны');
+      } else {
+        const res = await fetch(f.fetchUrl + '?_t=' + Date.now());
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        f.blob   = blob;
+        f.size   = blob.size;
+        f.status = 'ok';
+        ok++;
+        log('✓ ' + f.path + ' (' + fmtSize(f.size) + ')', 'ok');
+      }
+    } catch (e) {
+      f.status = 'err';
+      f.error  = e.message;
+      err++;
+      log('✕ ' + f.path + ': ' + e.message, 'err');
+    }
+    renderFileList();
+  }
+
+  progressFill.style.width = '100%';
+  progressLabel.textContent = 'Готово: ' + ok + ' загружено, ' + err + ' ошибок';
+  downloadBtn.disabled = (ok === 0);
+  refreshBtn.disabled = false;
+
+  summaryEl.style.display = 'block';
+  if (err === 0) {
+    summaryEl.className = 'summary ok';
+    summaryEl.textContent = '✅ Все ' + ok + ' файлов загружены. Нажмите «Скачать ZIP».';
+  } else if (ok > 0) {
+    summaryEl.className = 'summary warn';
+    summaryEl.textContent = '⚠️ Загружено ' + ok + ' из ' + fileStatuses.length + '. Файлы с ошибкой не войдут в архив.';
+  } else {
+    summaryEl.className = 'summary err';
+    summaryEl.textContent = '❌ Не удалось загрузить ни одного файла. Откройте страницу на сервере, не из превью.';
+  }
+}
+
+// ─── Создание ZIP ─────────────────────────────────────────────────────────────
+async function downloadZip() {
+  if (typeof JSZip === 'undefined') {
+    alert('JSZip не загружен. Проверьте подключение к интернету.');
+    return;
+  }
+  const okFiles = fileStatuses.filter(f => f.status === 'ok' && f.blob);
+  if (!okFiles.length) {
+    alert('Нет загруженных файлов.');
+    return;
+  }
+
+  downloadBtn.disabled = true;
+  downloadBtn.innerHTML = '<span>⏳</span><span>Упаковка…</span>';
+
+  try {
+    const zip = new JSZip();
+    const folder = zip.folder('doc-checker');
+
+    for (const f of okFiles) {
+      folder.file(f.path, f.blob);
+    }
+
+    folder.file('api/CONFIG_NOTE.txt',
+      'ВАЖНО: api/config.php не включён в архив — он содержит API-ключи.\n' +
+      'Не перезаписывайте config.php на сервере при обновлении!\n\n' +
+      'Дата экспорта: ' + new Date().toLocaleString('ru-RU')
+    );
+
+    const blob = await zip.generateAsync({
+      type: 'blob',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'doc-checker-' + dateStr + '.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+
+    log('📦 Скачан: doc-checker-' + dateStr + '.zip (' + fmtSize(blob.size) + ')', 'ok');
+    downloadBtn.innerHTML = '<span>✅</span><span>Скачано!</span>';
+    setTimeout(() => {
+      downloadBtn.innerHTML = '<span>⬇️</span><span>Скачать ZIP</span>';
+      downloadBtn.disabled = false;
+    }, 2000);
+
+  } catch (e) {
+    log('Ошибка ZIP: ' + e.message, 'err');
+    downloadBtn.innerHTML = '<span>⬇️</span><span>Скачать ZIP</span>';
+    downloadBtn.disabled = false;
+  }
+}
+
+// ─── Инициализация ────────────────────────────────────────────────────────────
+renderFileList();
+downloadBtn.addEventListener('click', downloadZip);
+refreshBtn.addEventListener('click', fetchAllFiles);
+fetchAllFiles();
+</script>
+</body>
+</html>

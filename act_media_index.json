@@ -1,0 +1,38 @@
+{
+    "373101d3aef93d841c1a0131": {
+        "id": "373101d3aef93d841c1a0131",
+        "kind": "photo",
+        "originalName": null,
+        "storedName": "373101d3aef93d841c1a0131.jpg",
+        "mimeType": "image\/jpeg",
+        "sizeBytes": 150592,
+        "uploadedAt": "2026-06-26T14:00:59+03:00"
+    },
+    "49d543be6d9ef7253137383c": {
+        "id": "49d543be6d9ef7253137383c",
+        "kind": "photo",
+        "originalName": null,
+        "storedName": "49d543be6d9ef7253137383c.jpg",
+        "mimeType": "image\/jpeg",
+        "sizeBytes": 2481475,
+        "uploadedAt": "2026-06-26T14:05:22+03:00"
+    },
+    "7a6dcaad6622a93c9f3e3708": {
+        "id": "7a6dcaad6622a93c9f3e3708",
+        "kind": "attachment",
+        "originalName": null,
+        "storedName": "7a6dcaad6622a93c9f3e3708.xlsx",
+        "mimeType": "application\/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "sizeBytes": 422039,
+        "uploadedAt": "2026-06-26T14:17:58+03:00"
+    },
+    "40a73d458eeeb8fcd9370bd6": {
+        "id": "40a73d458eeeb8fcd9370bd6",
+        "kind": "attachment",
+        "originalName": null,
+        "storedName": "40a73d458eeeb8fcd9370bd6.xlsx",
+        "mimeType": "application\/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "sizeBytes": 422039,
+        "uploadedAt": "2026-06-26T14:27:04+03:00"
+    }
+}

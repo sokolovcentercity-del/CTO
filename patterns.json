@@ -1,0 +1,34 @@
+{
+  "_version": 1,
+  "_description": "База паттернов ошибок распознавания. Пополняется через кнопку 'Сообщить об ошибке' в отчёте.",
+  "number_repair": [
+    {
+      "id": "upd-fns-price-1",
+      "source": "УПД ФНС, поле Цена (qty=1)",
+      "doc_type": "upd",
+      "field": "price",
+      "example_raw": ["238 352,31", "05269930"],
+      "example_wrong": "238352.31",
+      "example_correct": "238352.3105269930",
+      "rule": "Цена в УПД ФНС разбивается PDF-парсером на части. Все цифры после запятой — единое число. НЕ обрезай после 2 знаков.",
+      "verify": "qty × price = amount_no_vat",
+      "added_by": "system",
+      "added_at": "2026-06-10"
+    },
+    {
+      "id": "upd-fns-price-72",
+      "source": "УПД ФНС, поле Цена (qty=72)",
+      "doc_type": "upd",
+      "field": "price",
+      "example_raw": ["238352,31 05269930"],
+      "example_wrong": "238352.31",
+      "example_correct": "238352.31052699367",
+      "rule": "То же число, qty=72. Проверка: 72 × 238352.31052699367 = 17 161 366.36",
+      "verify": "72 × 238352.31052699367 = 17161366.36",
+      "added_by": "system",
+      "added_at": "2026-06-10"
+    }
+  ],
+  "field_errors": [],
+  "user_corrections": []
+}
